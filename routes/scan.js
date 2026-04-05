@@ -1,7 +1,7 @@
 // routes/scan.js
 const express = require('express');
 const multer = require('multer');
-const Anthropic = require('anthropic').default;
+const Anthropic = require('@anthropic-ai/sdk').default;
 const { pool } = require('../db');
 const { authMiddleware } = require('../middleware/auth');
 
