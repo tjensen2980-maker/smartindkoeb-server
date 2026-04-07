@@ -76,21 +76,39 @@ router.post('/seed', async (req, res) => {
     { store: 'Aldi', item: 'Rugbrød Schulstad', old_price: 22.00, new_price: 15.00, savings: 7, category: 'Brød', expiry_days: 4 },
     { store: 'Føtex', item: 'Æbler Royal Gala 1kg', old_price: 19.95, new_price: 12.95, savings: 7, category: 'Frugt & grønt', expiry_days: 5 },
     { store: 'Lidl', item: 'Cheddar ost 400g', old_price: 29.95, new_price: 19.95, savings: 10, category: 'Mejeri', expiry_days: 7 },
+    { store: 'Netto', item: 'Frilandsæg 10 stk', old_price: 34.95, new_price: 24.95, savings: 10, category: 'Mejeri', expiry_days: 5 },
+    { store: 'Rema 1000', item: 'Fuldkornspasta 500g', old_price: 14.95, new_price: 9.95, savings: 5, category: 'Kolonial', expiry_days: 10 },
+    { store: 'Bilka', item: 'Karolines køkken suppe', old_price: 28.95, new_price: 18.95, savings: 10, category: 'Kolonial', expiry_days: 7 },
+    { store: 'Føtex', item: 'Avocado 2 stk', old_price: 20.00, new_price: 12.00, savings: 8, category: 'Frugt & grønt', expiry_days: 3 },
+    { store: 'Aldi', item: 'Minimælk 1L', old_price: 12.50, new_price: 8.95, savings: 3.55, category: 'Mejeri', expiry_days: 4 },
   ];
 
   try {
+    // Clear old expired deals first
+    await pool.query('DELETE FROM deals WHERE expiry_date < CURRENT_DATE');
+    
+    let inserted = 0;
     for (const d of sampleDeals) {
-      await pool.query(
-        `INSERT INTO deals (store, item, old_price, new_price, savings, category, expiry_date)
-         VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE + $7)
-         ON CONFLICT DO NOTHING`,
-        [d.store, d.item, d.old_price, d.new_price, d.savings, d.category, d.expiry_days]
+      // Check if deal already exists
+      const existing = await pool.query(
+        'SELECT id FROM deals WHERE item = $1 AND store = $2 AND expiry_date >= CURRENT_DATE',
+        [d.item, d.store]
       );
+      
+      if (existing.rows.length === 0) {
+        await pool.query(
+          `INSERT INTO deals (store, item, old_price, new_price, savings, category, expiry_date)
+           VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE + $7)`,
+          [d.store, d.item, d.old_price, d.new_price, d.savings, d.category, d.expiry_days]
+        );
+        inserted++;
+      }
     }
-    res.json({ message: 'Deals seeded', count: sampleDeals.length });
+    
+    res.json({ message: 'Deals seeded', inserted, total: sampleDeals.length });
   } catch (err) {
-    console.error('Seed error:', err);
-    res.status(500).json({ error: 'Serverfejl' });
+    console.error('Seed error:', err.message);
+    res.status(500).json({ error: 'Seed fejlede: ' + err.message });
   }
 });
 
