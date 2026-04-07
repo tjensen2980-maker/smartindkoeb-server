@@ -6,15 +6,45 @@ const { authMiddleware } = require('../middleware/auth');
 const router = express.Router();
 
 const COMMON_SEARCHES = ['mælk', 'smør', 'ost', 'brød', 'kylling', 'hakket oksekød', 'æg', 'bananer', 'kartofler', 'pasta', 'ris', 'kaffe', 'yoghurt', 'pølser', 'juice'];
-
-// Default: Fredericia
 const DEFAULT_LAT = 55.57;
 const DEFAULT_LNG = 9.75;
 
+let migrated = false;
+
+async function migrate() {
+  if (migrated) return;
+  try {
+    // Drop og genskab deals tabellen med alle kolonner
+    await pool.query('DROP TABLE IF EXISTS deals');
+    await pool.query(`
+      CREATE TABLE deals (
+        id SERIAL PRIMARY KEY,
+        store VARCHAR(100) NOT NULL,
+        item VARCHAR(255) NOT NULL,
+        old_price DECIMAL(10,2),
+        new_price DECIMAL(10,2),
+        savings DECIMAL(10,2),
+        category VARCHAR(100),
+        expiry_date DATE,
+        image TEXT,
+        lat DECIMAL(8,5),
+        lng DECIMAL(8,5),
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    console.log('✅ Deals table created with all columns');
+    migrated = true;
+  } catch (err) {
+    console.error('Migration error:', err.message);
+    migrated = true; // Don't retry
+  }
+}
+
 async function searchTilbudsugen(query, lat, lng) {
   try {
-    // Tilbudsugen API med lokation
-    const url = `https://www.tilbudsugen.dk/api/api/typeahead-search/dk/${encodeURIComponent(query)}?lat=${lat}&lng=${lng}`;
+    let url = `https://www.tilbudsugen.dk/api/api/typeahead-search/dk/${encodeURIComponent(query)}`;
+    if (lat && lng) url += `?lat=${lat}&lng=${lng}`;
+    
     const response = await fetch(url, { headers: { 'Accept': 'application/json' } });
     if (!response.ok) return [];
     const data = await response.json();
@@ -41,29 +71,15 @@ router.get('/', authMiddleware, async (req, res) => {
   const lng = parseFloat(req.query.lng) || DEFAULT_LNG;
 
   try {
-    // Ensure deals table has image column
-    try {
-      const check = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'deals' AND column_name = 'image'");
-      if (check.rows.length === 0) {
-        await pool.query('DROP TABLE IF EXISTS deals CASCADE');
-        await pool.query(`CREATE TABLE deals (
-          id SERIAL PRIMARY KEY, store VARCHAR(100) NOT NULL, item VARCHAR(255) NOT NULL,
-          old_price DECIMAL(10,2), new_price DECIMAL(10,2), savings DECIMAL(10,2),
-          category VARCHAR(100), expiry_date DATE, image TEXT, lat DECIMAL(8,5), lng DECIMAL(8,5),
-          created_at TIMESTAMP DEFAULT NOW()
-        )`);
-        console.log('✅ Deals table recreated with image + location');
-      }
-    } catch(e) {}
+    await migrate();
 
-    // Cache check - brug location-specifik cache (inden for 5 km)
+    // Cache check (2 timer, location-aware)
     const cached = await pool.query(
       `SELECT id, store, item, new_price, category, image, expiry_date, created_at
-       FROM deals 
+       FROM deals
        WHERE created_at > NOW() - INTERVAL '2 hours'
-         AND lat IS NOT NULL
          AND ABS(lat - $1) < 0.05 AND ABS(lng - $2) < 0.05
-       ORDER BY id DESC LIMIT 50`,
+       ORDER BY id DESC LIMIT 60`,
       [lat, lng]
     );
 
@@ -73,8 +89,8 @@ router.get('/', authMiddleware, async (req, res) => {
       return res.json({ deals, source: 'cache', location: { lat, lng } });
     }
 
-    // Hent friske tilbud med lokation
-    console.log(`Fetching deals near ${lat},${lng}...`);
+    // Hent friske tilbud
+    console.log(`Fetching deals near ${lat}, ${lng}...`);
     const shuffled = [...COMMON_SEARCHES].sort(() => Math.random() - 0.5);
     const searches = shuffled.slice(0, 6);
 
@@ -91,13 +107,13 @@ router.get('/', authMiddleware, async (req, res) => {
       }
     }
 
-    console.log('Found', allDeals.length, 'local deals');
+    console.log('Found', allDeals.length, 'deals from', searches.join(', '));
 
     if (allDeals.length === 0) {
       return res.json({ deals: [], source: 'empty', location: { lat, lng } });
     }
 
-    // Cache med lokation
+    // Ryd gammel cache
     await pool.query("DELETE FROM deals WHERE created_at < NOW() - INTERVAL '4 hours'");
 
     const insertedDeals = [];
@@ -116,7 +132,7 @@ router.get('/', authMiddleware, async (req, res) => {
       }
     }
 
-    console.log('Cached', insertedDeals.length, 'local deals');
+    console.log('Cached', insertedDeals.length, 'deals');
 
     let deals = insertedDeals;
     if (category && category !== 'Alle') deals = deals.filter(d => d.category === category);
