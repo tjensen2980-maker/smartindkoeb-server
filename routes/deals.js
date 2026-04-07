@@ -5,10 +5,89 @@ const { pool } = require('../db');
 const { authMiddleware } = require('../middleware/auth');
 
 const router = express.Router();
-
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// GET /deals - Hent personaliserede tilbud via AI
+// Tjek/eTilbudsavis business IDs for Danish stores
+const STORE_IDS = {
+  'Netto': '9ba51',
+  'Rema 1000': '11deC',
+  'Føtex': 'bfMe0',
+  'Bilka': '93f13',
+  'Lidl': '71c90',
+  'Aldi': 'b7Dnn',
+  'Meny': 'a23s7',
+  'Spar': '230Lm',
+  'Coop365': 'c1G3q',
+};
+
+// Fetch real offers from eTilbudsavis/Tjek
+async function fetchRealDeals(storeNames) {
+  const allDeals = [];
+
+  for (const storeName of storeNames) {
+    const storeId = STORE_IDS[storeName];
+    if (!storeId) continue;
+
+    try {
+      const url = `https://squid-api.tjek.com/v4/rpc/get_offers?r_lat=55.5&r_lng=9.75&r_radius=50000&r_locale=da_DK&dealer_ids=${storeId}&limit=20&order_by=-savings`;
+      
+      console.log(`Fetching deals from ${storeName} (${storeId})...`);
+      const response = await fetch(url, {
+        headers: {
+          'Accept': 'application/json',
+          'User-Agent': 'SmartIndkoeb/1.0',
+        },
+      });
+
+      if (!response.ok) {
+        console.warn(`Tjek API returned ${response.status} for ${storeName}`);
+        continue;
+      }
+
+      const data = await response.json();
+      
+      if (Array.isArray(data)) {
+        for (const offer of data) {
+          if (!offer.name || !offer.pricing) continue;
+          
+          const price = offer.pricing?.price || null;
+          const prePrice = offer.pricing?.pre_price || null;
+          const savings = prePrice && price ? Math.round((prePrice - price) * 100) / 100 : 0;
+
+          allDeals.push({
+            store: storeName,
+            item: offer.name,
+            old_price: prePrice || price,
+            new_price: price,
+            savings: savings,
+            category: categorize(offer.name),
+            expiry_date: offer.valid_until ? offer.valid_until.split('T')[0] : null,
+            image: offer.images?.view_url || null,
+          });
+        }
+      }
+    } catch (err) {
+      console.warn(`Error fetching ${storeName}:`, err.message);
+    }
+  }
+
+  return allDeals;
+}
+
+// Simple Danish grocery categorizer
+function categorize(itemName) {
+  const name = itemName.toLowerCase();
+  if (/mælk|ost|smør|yoghurt|skyr|fløde|æg/.test(name)) return 'Mejeri';
+  if (/kylling|okse|svine|hakke|pølse|bacon|laks|fisk|rejer/.test(name)) return 'Kød & fisk';
+  if (/æble|banan|tomat|agurk|salat|løg|kartof|gulerod|frugt|grønt|avocado|peber/.test(name)) return 'Frugt & grønt';
+  if (/brød|rugbrød|bolle|kage|wiener/.test(name)) return 'Brød & bageri';
+  if (/cola|pepsi|juice|vand|øl|vin|kaffe|te/.test(name)) return 'Drikkevarer';
+  if (/frossen|frost|is|pizza/.test(name)) return 'Frost';
+  if (/shampoo|toilet|vaske|rengør|opvask/.test(name)) return 'Husholdning';
+  return 'Kolonial';
+}
+
+// GET /deals - Hent ægte tilbud fra danske supermarkeder
 router.get('/', authMiddleware, async (req, res) => {
   const { category, limit = 30 } = req.query;
 
@@ -20,23 +99,13 @@ router.get('/', authMiddleware, async (req, res) => {
     );
     const selectedStores = settings.rows[0]?.selected_stores || ['Netto', 'Rema 1000', 'Føtex'];
 
-    // 2. Hent brugerens indkøbshistorik
-    const history = await pool.query(
-      `SELECT text, store FROM shopping_items 
-       WHERE list_id IN (SELECT id FROM shopping_lists WHERE user_id = $1)
-       AND checked = true
-       ORDER BY created_at DESC LIMIT 30`,
-      [req.userId]
-    );
-    const purchasedItems = history.rows.map(r => r.text);
-
-    // 3. Tjek om vi har friske tilbud i databasen (under 6 timer gamle)
+    // 2. Tjek cache (under 3 timer gamle)
     const freshDeals = await pool.query(
       `SELECT id, store, item, old_price, new_price, savings, category, expiry_date, created_at
        FROM deals 
        WHERE expiry_date >= CURRENT_DATE
          AND store = ANY($1)
-         AND created_at > NOW() - INTERVAL '6 hours'
+         AND created_at > NOW() - INTERVAL '3 hours'
        ORDER BY savings DESC
        LIMIT $2`,
       [selectedStores, parseInt(limit)]
@@ -50,73 +119,89 @@ router.get('/', authMiddleware, async (req, res) => {
       return res.json({ deals, source: 'cache' });
     }
 
-    // 4. Brug AI til at generere nye tilbud
-    const today = new Date().toISOString().split('T')[0];
-    const dayName = ['søndag', 'mandag', 'tirsdag', 'onsdag', 'torsdag', 'fredag', 'lørdag'][new Date().getDay()];
+    // 3. Hent ægte tilbud fra eTilbudsavis
+    console.log('Fetching real deals from eTilbudsavis...');
+    let realDeals = await fetchRealDeals(selectedStores);
+    console.log(`Got ${realDeals.length} real deals`);
 
-    const purchaseContext = purchasedItems.length > 0
-      ? `\nBrugeren har tidligere købt: ${purchasedItems.slice(0, 15).join(', ')}. Prioriter tilbud på lignende varer.`
-      : '';
+    // 4. Personalisér med AI baseret på brugerens historik
+    const history = await pool.query(
+      `SELECT text FROM shopping_items 
+       WHERE list_id IN (SELECT id FROM shopping_lists WHERE user_id = $1)
+       AND checked = true
+       ORDER BY created_at DESC LIMIT 20`,
+      [req.userId]
+    );
+    const purchasedItems = history.rows.map(r => r.text);
 
-    const prompt = `Du er en dansk dagligvare-ekspert. Generer realistiske aktuelle tilbud fra danske supermarkeder.
+    if (purchasedItems.length > 0 && realDeals.length > 10) {
+      try {
+        // Lad AI ranke tilbuddene baseret på brugerens vaner
+        const dealNames = realDeals.slice(0, 40).map((d, i) => `${i}: ${d.item} (${d.store}, ${d.savings} kr spart)`).join('\n');
+        
+        const prompt = `Brugeren har tidligere købt: ${purchasedItems.join(', ')}.
 
-Dato: ${today} (${dayName})
-Butikker: ${selectedStores.join(', ')}
-${purchaseContext}
+Her er aktuelle tilbud:
+${dealNames}
 
-Generer 15-20 realistiske tilbud der kunne findes i danske supermarkeder lige nu. 
-Priserne skal være realistiske for danske supermarkeder i 2026.
-Brug kategorier: Mejeri, Kød, Frugt & grønt, Brød, Kolonial, Drikkevarer, Frost, Husholdning.
-Varier mellem hverdagsvarer og sæsonvarer.
-expiry_days skal være et heltal mellem 1 og 10.
+Ranker de 20 mest relevante tilbud for denne bruger (baseret på deres købshistorik). Svar KUN med en JSON array af indeks-numre, f.eks. [3, 1, 7, 12, ...]. Ingen forklaring.`;
 
-Svar KUN med valid JSON array (ingen markdown, ingen backticks):
-[{"store":"Butiksnavn","item":"Varenavn","old_price":29.95,"new_price":19.95,"savings":10,"category":"Kategori","expiry_days":3}]`;
+        const aiResponse = await client.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 256,
+          messages: [{ role: 'user', content: prompt }],
+        });
 
-    console.log('Calling Claude AI for deals...');
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 2048,
-      messages: [{ role: 'user', content: prompt }],
-    });
-
-    const text = response.content.map(b => b.text || '').join('');
-    const cleaned = text.replace(/```json|```/g, '').trim();
-    console.log('AI response length:', cleaned.length);
-    
-    const aiDeals = JSON.parse(cleaned);
-    console.log('Parsed', aiDeals.length, 'deals from AI');
-
-    // 5. Ryd gamle tilbud og gem nye
-    await pool.query("DELETE FROM deals WHERE created_at < NOW() - INTERVAL '12 hours'");
-
-    const insertedDeals = [];
-    for (const d of aiDeals) {
-      if (!selectedStores.includes(d.store)) continue;
-      
-      const expiryDays = parseInt(d.expiry_days) || 3;
-      
-      const result = await pool.query(
-        `INSERT INTO deals (store, item, old_price, new_price, savings, category, expiry_date)
-         VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE + ($7::integer || ' days')::interval)
-         RETURNING id, store, item, old_price, new_price, savings, category, expiry_date, created_at`,
-        [d.store, d.item, d.old_price, d.new_price, d.savings, d.category, expiryDays]
-      );
-      insertedDeals.push(result.rows[0]);
+        const rankText = aiResponse.content.map(b => b.text || '').join('').trim();
+        const rankedIndices = JSON.parse(rankText.replace(/```json|```/g, ''));
+        
+        // Reorder deals based on AI ranking
+        const rankedDeals = rankedIndices
+          .filter(i => i >= 0 && i < realDeals.length)
+          .map(i => realDeals[i]);
+        
+        // Add remaining deals that weren't ranked
+        const rankedSet = new Set(rankedIndices);
+        const remaining = realDeals.filter((_, i) => !rankedSet.has(i));
+        realDeals = [...rankedDeals, ...remaining];
+        
+        console.log('AI personalized deal ranking');
+      } catch (aiErr) {
+        console.warn('AI ranking failed, using default order:', aiErr.message);
+      }
     }
 
-    console.log('Inserted', insertedDeals.length, 'deals into DB');
+    // 5. Gem i database cache
+    await pool.query("DELETE FROM deals WHERE created_at < NOW() - INTERVAL '6 hours'");
+
+    const insertedDeals = [];
+    for (const d of realDeals.slice(0, parseInt(limit))) {
+      try {
+        const expiryDate = d.expiry_date || new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
+        
+        const result = await pool.query(
+          `INSERT INTO deals (store, item, old_price, new_price, savings, category, expiry_date)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::date)
+           RETURNING id, store, item, old_price, new_price, savings, category, expiry_date, created_at`,
+          [d.store, d.item, d.old_price, d.new_price, d.savings, d.category, expiryDate]
+        );
+        insertedDeals.push(result.rows[0]);
+      } catch (insertErr) {
+        console.warn('Insert deal error:', insertErr.message);
+      }
+    }
+
+    console.log(`Cached ${insertedDeals.length} deals`);
 
     let deals = insertedDeals;
     if (category && category !== 'Alle') {
       deals = deals.filter(d => d.category === category);
     }
 
-    res.json({ deals, source: 'ai', generated: insertedDeals.length });
+    res.json({ deals, source: 'live', fetched: realDeals.length, cached: insertedDeals.length });
   } catch (err) {
     console.error('Deals error:', err.message);
     
-    // Fallback: hent hvad der er i databasen
     try {
       const fallback = await pool.query(
         `SELECT id, store, item, old_price, new_price, savings, category, expiry_date, created_at
@@ -139,17 +224,17 @@ router.get('/categories', async (req, res) => {
     const categories = result.rows.map(r => r.category).filter(Boolean);
     res.json({ categories: ['Alle', ...categories] });
   } catch (err) {
-    res.json({ categories: ['Alle', 'Mejeri', 'Kød', 'Frugt & grønt', 'Brød', 'Kolonial', 'Drikkevarer'] });
+    res.json({ categories: ['Alle', 'Mejeri', 'Kød & fisk', 'Frugt & grønt', 'Brød & bageri', 'Kolonial', 'Drikkevarer'] });
   }
 });
 
-// POST /deals/refresh - Tving ny AI-generering
+// POST /deals/refresh - Tving nye tilbud
 router.post('/refresh', authMiddleware, async (req, res) => {
   try {
-    await pool.query("DELETE FROM deals WHERE created_at < NOW() - INTERVAL '1 hour'");
+    await pool.query('DELETE FROM deals');
     res.json({ message: 'Cache ryddet. Hent /deals for nye tilbud.' });
   } catch (err) {
-    res.status(500).json({ error: 'Kunne ikke opdatere tilbud' });
+    res.status(500).json({ error: 'Kunne ikke rydde cache' });
   }
 });
 
