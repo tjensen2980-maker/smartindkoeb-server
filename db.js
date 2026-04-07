@@ -11,7 +11,6 @@ async function initDB() {
   const client = await pool.connect();
   try {
     await client.query(`
-      -- Brugere
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         email VARCHAR(255) UNIQUE NOT NULL,
@@ -22,7 +21,6 @@ async function initDB() {
         updated_at TIMESTAMP DEFAULT NOW()
       );
 
-      -- Bruger-indstillinger
       CREATE TABLE IF NOT EXISTS user_settings (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -31,7 +29,6 @@ async function initDB() {
         UNIQUE(user_id)
       );
 
-      -- Indkøbslister
       CREATE TABLE IF NOT EXISTS shopping_lists (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -39,7 +36,6 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT NOW()
       );
 
-      -- Indkøbsliste-varer
       CREATE TABLE IF NOT EXISTS shopping_items (
         id SERIAL PRIMARY KEY,
         list_id INTEGER REFERENCES shopping_lists(id) ON DELETE CASCADE,
@@ -49,7 +45,6 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT NOW()
       );
 
-      -- Tilbud (populeres fra ekstern kilde / admin)
       CREATE TABLE IF NOT EXISTS deals (
         id SERIAL PRIMARY KEY,
         store VARCHAR(100) NOT NULL,
@@ -59,10 +54,11 @@ async function initDB() {
         savings DECIMAL(10,2),
         category VARCHAR(100),
         expiry_date DATE,
+        image TEXT,
+        search_term VARCHAR(100),
         created_at TIMESTAMP DEFAULT NOW()
       );
 
-      -- Madplaner
       CREATE TABLE IF NOT EXISTS meal_plans (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -71,7 +67,6 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT NOW()
       );
 
-      -- Madplan-dage
       CREATE TABLE IF NOT EXISTS meal_days (
         id SERIAL PRIMARY KEY,
         plan_id INTEGER REFERENCES meal_plans(id) ON DELETE CASCADE,
@@ -82,7 +77,6 @@ async function initDB() {
         estimated_savings DECIMAL(10,2) DEFAULT 0
       );
 
-      -- Scan-historik
       CREATE TABLE IF NOT EXISTS scan_history (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -91,7 +85,6 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT NOW()
       );
 
-      -- Besparelser (tracking)
       CREATE TABLE IF NOT EXISTS savings_log (
         id SERIAL PRIMARY KEY,
         user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -103,6 +96,21 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT NOW()
       );
     `);
+
+    // Tilføj manglende kolonner til eksisterende deals tabel
+    await client.query(`
+      DO $$ BEGIN
+        ALTER TABLE deals ADD COLUMN IF NOT EXISTS image TEXT;
+      EXCEPTION WHEN OTHERS THEN NULL;
+      END $$;
+    `);
+    await client.query(`
+      DO $$ BEGIN
+        ALTER TABLE deals ADD COLUMN IF NOT EXISTS search_term VARCHAR(100);
+      EXCEPTION WHEN OTHERS THEN NULL;
+      END $$;
+    `);
+
     console.log('✅ Database tables initialized');
   } catch (err) {
     console.error('❌ Database init error:', err.message);
