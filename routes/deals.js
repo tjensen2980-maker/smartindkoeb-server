@@ -10,6 +10,27 @@ const DEFAULT_LAT = 55.57;
 const DEFAULT_LNG = 9.75;
 const RADIUS = 20000;
 
+// KUN danske dagligvarebutikker
+const GROCERY_STORES = new Set([
+  'netto', 'rema 1000', 'føtex', 'bilka', 'lidl', 'aldi',
+  'meny', 'spar', 'kvickly', 'superbrugsen', 'dagli\'brugsen',
+  '365discount', 'coop 365discount', 'coop 365', 'fakta', 'irma',
+  'løvbjerg', 'let-køb', 'min købmand', 'brugsen', 'abc lavpris',
+  'nemlig.com', 'mad cooperativet', 'døgnkiosken',
+]);
+
+function isGroceryStore(name) {
+  if (!name) return false;
+  const lower = name.toLowerCase().trim();
+  // Direkte match
+  if (GROCERY_STORES.has(lower)) return true;
+  // Delvis match (f.eks. "REMA 1000" matcher "rema 1000")
+  for (const store of GROCERY_STORES) {
+    if (lower.includes(store) || store.includes(lower)) return true;
+  }
+  return false;
+}
+
 let migrated = false;
 
 async function migrate() {
@@ -34,7 +55,7 @@ async function migrate() {
         created_at TIMESTAMP DEFAULT NOW()
       )
     `);
-    console.log('✅ Deals table created with quantity + description');
+    console.log('✅ Deals table created');
     migrated = true;
   } catch (err) {
     console.error('Migration error:', err.message);
@@ -48,8 +69,6 @@ function formatQuantity(offer) {
   const size = q.size?.from;
   const unit = q.unit?.symbol;
   if (!size || !unit) return null;
-  
-  // Konverter til læsbar form
   if (unit === 'g' && size >= 1000) return (size / 1000) + ' kg';
   if (unit === 'ml' && size >= 1000) return (size / 1000) + ' L';
   if (unit === 'cl') return (size / 100) + ' L';
@@ -69,21 +88,24 @@ async function searchEtilbudsavis(query, lat, lng) {
     const data = await response.json();
     if (!Array.isArray(data)) return [];
 
-    return data.map(offer => ({
-      id: offer.id,
-      store: offer.branding?.name || 'Ukendt',
-      item: offer.heading || '',
-      description: offer.description || '',
-      old_price: offer.pricing?.pre_price || null,
-      new_price: offer.pricing?.price || null,
-      savings: (offer.pricing?.pre_price && offer.pricing?.price)
-        ? Math.round((offer.pricing.pre_price - offer.pricing.price) * 100) / 100
-        : null,
-      quantity: formatQuantity(offer),
-      category: offer.branding?.name || 'Dagligvarer',
-      image: offer.images?.view || offer.images?.thumb || null,
-      expiry_date: offer.run_till ? offer.run_till.split('T')[0] : null,
-    })).filter(d => d.item);
+    return data
+      .filter(offer => isGroceryStore(offer.branding?.name))
+      .map(offer => ({
+        id: offer.id,
+        store: offer.branding?.name || 'Ukendt',
+        item: offer.heading || '',
+        description: offer.description || '',
+        old_price: offer.pricing?.pre_price || null,
+        new_price: offer.pricing?.price || null,
+        savings: (offer.pricing?.pre_price && offer.pricing?.price)
+          ? Math.round((offer.pricing.pre_price - offer.pricing.price) * 100) / 100
+          : null,
+        quantity: formatQuantity(offer),
+        category: offer.branding?.name || 'Dagligvarer',
+        image: offer.images?.view || offer.images?.thumb || null,
+        expiry_date: offer.run_till ? offer.run_till.split('T')[0] : null,
+      }))
+      .filter(d => d.item);
   } catch (err) {
     console.warn('Search error for', query, ':', err.message);
     return [];
@@ -115,7 +137,7 @@ router.get('/', authMiddleware, async (req, res) => {
       return res.json({ deals, source: 'cache', location: { lat, lng } });
     }
 
-    console.log(`Fetching deals within 20km of ${lat}, ${lng}...`);
+    console.log(`Fetching grocery deals within 20km of ${lat}, ${lng}...`);
     const shuffled = [...COMMON_SEARCHES].sort(() => Math.random() - 0.5);
     const searches = shuffled.slice(0, 6);
 
@@ -132,7 +154,7 @@ router.get('/', authMiddleware, async (req, res) => {
       }
     }
 
-    console.log('Found', allDeals.length, 'deals within 20km');
+    console.log('Found', allDeals.length, 'grocery deals (filtered)');
 
     if (allDeals.length === 0) {
       return res.json({ deals: [], source: 'empty', location: { lat, lng } });
@@ -156,7 +178,7 @@ router.get('/', authMiddleware, async (req, res) => {
       }
     }
 
-    console.log('Cached', insertedDeals.length, 'deals');
+    console.log('Cached', insertedDeals.length, 'grocery deals');
 
     let deals = insertedDeals;
     if (category && category !== 'Alle') deals = deals.filter(d => d.category === category);
