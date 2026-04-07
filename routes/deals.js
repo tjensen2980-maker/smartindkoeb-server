@@ -7,9 +7,14 @@ const router = express.Router();
 
 const COMMON_SEARCHES = ['mælk', 'smør', 'ost', 'brød', 'kylling', 'hakket oksekød', 'æg', 'bananer', 'kartofler', 'pasta', 'ris', 'kaffe', 'yoghurt', 'pølser', 'juice'];
 
-async function searchTilbudsugen(query) {
+// Default: Fredericia
+const DEFAULT_LAT = 55.57;
+const DEFAULT_LNG = 9.75;
+
+async function searchTilbudsugen(query, lat, lng) {
   try {
-    const url = `https://www.tilbudsugen.dk/api/api/typeahead-search/dk/${encodeURIComponent(query)}`;
+    // Tilbudsugen API med lokation
+    const url = `https://www.tilbudsugen.dk/api/api/typeahead-search/dk/${encodeURIComponent(query)}?lat=${lat}&lng=${lng}`;
     const response = await fetch(url, { headers: { 'Accept': 'application/json' } });
     if (!response.ok) return [];
     const data = await response.json();
@@ -29,44 +34,51 @@ async function searchTilbudsugen(query) {
   }
 }
 
-// GET /deals - Hent ægte tilbud på almindelige dagligvarer
+// GET /deals?lat=55.57&lng=9.75
 router.get('/', authMiddleware, async (req, res) => {
   const { category } = req.query;
+  const lat = parseFloat(req.query.lat) || DEFAULT_LAT;
+  const lng = parseFloat(req.query.lng) || DEFAULT_LNG;
 
   try {
-    // Cache check (2 timer)
+    // Ensure deals table has image column
     try {
-      const cached = await pool.query(
-        `SELECT id, store, item, new_price, category, image, expiry_date, created_at
-         FROM deals WHERE created_at > NOW() - INTERVAL '2 hours'
-         ORDER BY id DESC LIMIT 50`
-      );
-      if (cached.rows.length >= 15) {
-        let deals = cached.rows;
-        if (category && category !== 'Alle') deals = deals.filter(d => d.category === category);
-        return res.json({ deals, source: 'cache' });
+      const check = await pool.query("SELECT column_name FROM information_schema.columns WHERE table_name = 'deals' AND column_name = 'image'");
+      if (check.rows.length === 0) {
+        await pool.query('DROP TABLE IF EXISTS deals CASCADE');
+        await pool.query(`CREATE TABLE deals (
+          id SERIAL PRIMARY KEY, store VARCHAR(100) NOT NULL, item VARCHAR(255) NOT NULL,
+          old_price DECIMAL(10,2), new_price DECIMAL(10,2), savings DECIMAL(10,2),
+          category VARCHAR(100), expiry_date DATE, image TEXT, lat DECIMAL(8,5), lng DECIMAL(8,5),
+          created_at TIMESTAMP DEFAULT NOW()
+        )`);
+        console.log('✅ Deals table recreated with image + location');
       }
-    } catch (cacheErr) {
-      // image kolonne mangler måske - prøv uden
-      console.warn('Cache query error, trying without image:', cacheErr.message);
-      const cached = await pool.query(
-        `SELECT id, store, item, new_price, category, expiry_date, created_at
-         FROM deals WHERE created_at > NOW() - INTERVAL '2 hours'
-         ORDER BY id DESC LIMIT 50`
-      );
-      if (cached.rows.length >= 15) {
-        let deals = cached.rows;
-        if (category && category !== 'Alle') deals = deals.filter(d => d.category === category);
-        return res.json({ deals, source: 'cache' });
-      }
+    } catch(e) {}
+
+    // Cache check - brug location-specifik cache (inden for 5 km)
+    const cached = await pool.query(
+      `SELECT id, store, item, new_price, category, image, expiry_date, created_at
+       FROM deals 
+       WHERE created_at > NOW() - INTERVAL '2 hours'
+         AND lat IS NOT NULL
+         AND ABS(lat - $1) < 0.05 AND ABS(lng - $2) < 0.05
+       ORDER BY id DESC LIMIT 50`,
+      [lat, lng]
+    );
+
+    if (cached.rows.length >= 15) {
+      let deals = cached.rows;
+      if (category && category !== 'Alle') deals = deals.filter(d => d.category === category);
+      return res.json({ deals, source: 'cache', location: { lat, lng } });
     }
 
-    // Hent friske tilbud
-    console.log('Fetching fresh deals from tilbudsugen.dk...');
+    // Hent friske tilbud med lokation
+    console.log(`Fetching deals near ${lat},${lng}...`);
     const shuffled = [...COMMON_SEARCHES].sort(() => Math.random() - 0.5);
     const searches = shuffled.slice(0, 6);
 
-    const results = await Promise.all(searches.map(term => searchTilbudsugen(term)));
+    const results = await Promise.all(searches.map(term => searchTilbudsugen(term, lat, lng)));
 
     const allDeals = [];
     const seenIds = new Set();
@@ -79,13 +91,13 @@ router.get('/', authMiddleware, async (req, res) => {
       }
     }
 
-    console.log('Found', allDeals.length, 'deals from', searches.join(', '));
+    console.log('Found', allDeals.length, 'local deals');
 
     if (allDeals.length === 0) {
-      return res.json({ deals: [], source: 'empty' });
+      return res.json({ deals: [], source: 'empty', location: { lat, lng } });
     }
 
-    // Ryd gammel cache og gem nye deals
+    // Cache med lokation
     await pool.query("DELETE FROM deals WHERE created_at < NOW() - INTERVAL '4 hours'");
 
     const insertedDeals = [];
@@ -93,47 +105,38 @@ router.get('/', authMiddleware, async (req, res) => {
       try {
         const expiry = d.expiry_date || new Date(Date.now() + 7 * 86400000).toISOString().split('T')[0];
         const result = await pool.query(
-          `INSERT INTO deals (store, item, new_price, category, expiry_date, image)
-           VALUES ($1, $2, $3, $4, $5::date, $6)
+          `INSERT INTO deals (store, item, new_price, category, expiry_date, image, lat, lng)
+           VALUES ($1, $2, $3, $4, $5::date, $6, $7, $8)
            RETURNING id, store, item, new_price, category, expiry_date, image, created_at`,
-          [d.store, d.item, d.new_price, d.category, expiry, d.image]
+          [d.store, d.item, d.new_price, d.category, expiry, d.image, lat, lng]
         );
         insertedDeals.push(result.rows[0]);
       } catch (e) {
-        // Hvis image kolonne mangler, prøv uden
-        try {
-          const result = await pool.query(
-            `INSERT INTO deals (store, item, new_price, category, expiry_date)
-             VALUES ($1, $2, $3, $4, $5::date)
-             RETURNING id, store, item, new_price, category, expiry_date, created_at`,
-            [d.store, d.item, d.new_price, d.category, expiry]
-          );
-          insertedDeals.push({ ...result.rows[0], image: d.image });
-        } catch (e2) {
-          console.warn('Insert error:', e2.message);
-        }
+        console.warn('Insert error:', e.message);
       }
     }
 
-    console.log('Cached', insertedDeals.length, 'deals');
+    console.log('Cached', insertedDeals.length, 'local deals');
 
     let deals = insertedDeals;
     if (category && category !== 'Alle') deals = deals.filter(d => d.category === category);
 
-    res.json({ deals, source: 'tilbudsugen', count: insertedDeals.length });
+    res.json({ deals, source: 'tilbudsugen', count: insertedDeals.length, location: { lat, lng } });
   } catch (err) {
     console.error('Deals error:', err.message);
     res.json({ deals: [], source: 'error', message: err.message });
   }
 });
 
-// GET /deals/search?q=mælk
+// GET /deals/search?q=mælk&lat=55.57&lng=9.75
 router.get('/search', authMiddleware, async (req, res) => {
   const { q } = req.query;
+  const lat = parseFloat(req.query.lat) || DEFAULT_LAT;
+  const lng = parseFloat(req.query.lng) || DEFAULT_LNG;
   if (!q || !q.trim()) return res.status(400).json({ error: 'Søgeord påkrævet' });
   try {
-    const deals = await searchTilbudsugen(q.trim());
-    res.json({ deals, query: q, source: 'tilbudsugen' });
+    const deals = await searchTilbudsugen(q.trim(), lat, lng);
+    res.json({ deals, query: q, source: 'tilbudsugen', location: { lat, lng } });
   } catch (err) {
     res.json({ deals: [], query: q, source: 'error' });
   }
