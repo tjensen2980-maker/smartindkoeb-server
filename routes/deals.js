@@ -20,7 +20,7 @@ router.get('/', authMiddleware, async (req, res) => {
     );
     const selectedStores = settings.rows[0]?.selected_stores || ['Netto', 'Rema 1000', 'Føtex'];
 
-    // 2. Hent brugerens indkøbshistorik (hvad de har købt før)
+    // 2. Hent brugerens indkøbshistorik
     const history = await pool.query(
       `SELECT text, store FROM shopping_items 
        WHERE list_id IN (SELECT id FROM shopping_lists WHERE user_id = $1)
@@ -43,7 +43,6 @@ router.get('/', authMiddleware, async (req, res) => {
     );
 
     if (freshDeals.rows.length >= 5) {
-      // Vi har friske tilbud — filtrer evt. på kategori
       let deals = freshDeals.rows;
       if (category && category !== 'Alle') {
         deals = deals.filter(d => d.category === category);
@@ -51,7 +50,7 @@ router.get('/', authMiddleware, async (req, res) => {
       return res.json({ deals, source: 'cache' });
     }
 
-    // 4. Ingen friske tilbud — brug AI til at generere nye
+    // 4. Brug AI til at generere nye tilbud
     const today = new Date().toISOString().split('T')[0];
     const dayName = ['søndag', 'mandag', 'tirsdag', 'onsdag', 'torsdag', 'fredag', 'lørdag'][new Date().getDay()];
 
@@ -69,10 +68,12 @@ Generer 15-20 realistiske tilbud der kunne findes i danske supermarkeder lige nu
 Priserne skal være realistiske for danske supermarkeder i 2026.
 Brug kategorier: Mejeri, Kød, Frugt & grønt, Brød, Kolonial, Drikkevarer, Frost, Husholdning.
 Varier mellem hverdagsvarer og sæsonvarer.
+expiry_days skal være et heltal mellem 1 og 10.
 
 Svar KUN med valid JSON array (ingen markdown, ingen backticks):
 [{"store":"Butiksnavn","item":"Varenavn","old_price":29.95,"new_price":19.95,"savings":10,"category":"Kategori","expiry_days":3}]`;
 
+    console.log('Calling Claude AI for deals...');
     const response = await client.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2048,
@@ -81,25 +82,31 @@ Svar KUN med valid JSON array (ingen markdown, ingen backticks):
 
     const text = response.content.map(b => b.text || '').join('');
     const cleaned = text.replace(/```json|```/g, '').trim();
+    console.log('AI response length:', cleaned.length);
+    
     const aiDeals = JSON.parse(cleaned);
+    console.log('Parsed', aiDeals.length, 'deals from AI');
 
-    // 5. Gem tilbud i databasen
-    await pool.query('DELETE FROM deals WHERE created_at < NOW() - INTERVAL \'12 hours\'');
+    // 5. Ryd gamle tilbud og gem nye
+    await pool.query("DELETE FROM deals WHERE created_at < NOW() - INTERVAL '12 hours'");
 
     const insertedDeals = [];
     for (const d of aiDeals) {
       if (!selectedStores.includes(d.store)) continue;
       
+      const expiryDays = parseInt(d.expiry_days) || 3;
+      
       const result = await pool.query(
         `INSERT INTO deals (store, item, old_price, new_price, savings, category, expiry_date)
-         VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE + $7)
+         VALUES ($1, $2, $3, $4, $5, $6, CURRENT_DATE + ($7::integer || ' days')::interval)
          RETURNING id, store, item, old_price, new_price, savings, category, expiry_date, created_at`,
-        [d.store, d.item, d.old_price, d.new_price, d.savings, d.category, d.expiry_days || 3]
+        [d.store, d.item, d.old_price, d.new_price, d.savings, d.category, expiryDays]
       );
       insertedDeals.push(result.rows[0]);
     }
 
-    // 6. Filtrer på kategori hvis angivet
+    console.log('Inserted', insertedDeals.length, 'deals into DB');
+
     let deals = insertedDeals;
     if (category && category !== 'Alle') {
       deals = deals.filter(d => d.category === category);
@@ -123,7 +130,7 @@ Svar KUN med valid JSON array (ingen markdown, ingen backticks):
   }
 });
 
-// GET /deals/categories - Hent unikke kategorier
+// GET /deals/categories
 router.get('/categories', async (req, res) => {
   try {
     const result = await pool.query(
@@ -136,13 +143,10 @@ router.get('/categories', async (req, res) => {
   }
 });
 
-// POST /deals/refresh - Tving ny AI-generering af tilbud
+// POST /deals/refresh - Tving ny AI-generering
 router.post('/refresh', authMiddleware, async (req, res) => {
   try {
-    // Slet brugerens gamle cached tilbud og tving refresh
-    await pool.query('DELETE FROM deals WHERE created_at < NOW() - INTERVAL \'1 hour\'');
-    
-    // Redirect til GET /deals som nu genererer nye
+    await pool.query("DELETE FROM deals WHERE created_at < NOW() - INTERVAL '1 hour'");
     res.json({ message: 'Cache ryddet. Hent /deals for nye tilbud.' });
   } catch (err) {
     res.status(500).json({ error: 'Kunne ikke opdatere tilbud' });
